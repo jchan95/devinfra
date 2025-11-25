@@ -816,47 +816,63 @@ async def get_eval_results(eval_run_id: str):
 async def compare_eval_runs(eval_set_id: str):
     """
     Compare all eval runs for an eval set.
-    
-    Shows which pipeline config performed best.
-    Like comparing different recipes side-by-side.
+
+    Shows which pipeline config performed best,
+    and includes where each config came from.
     """
-    
+
     # Get all runs for this eval set
-    runs = supabase.table("eval_runs") \
-        .select("*, pipeline_configs(name, parameters)") \
-        .eq("eval_set_id", eval_set_id) \
-        .eq("status", "completed") \
-        .order("created_at", desc=True) \
+    runs = (
+        supabase.table("eval_runs")
+        .select(
+            "*, pipeline_configs(name, parameters, origin, created_by_agent_run_id, parent_config_id)"
+        )
+        .eq("eval_set_id", eval_set_id)
+        .eq("status", "completed")
+        .order("created_at", desc=True)
         .execute()
-    
+    )
+
     if not runs.data:
         return {"message": "No completed runs found for this eval set", "runs": []}
-    
+
     # Format comparison
     comparison = []
     for run in runs.data:
-        comparison.append({
-            "eval_run_id": run["id"],
-            "config_name": run["pipeline_configs"]["name"],
-            "config_params": run["pipeline_configs"]["parameters"],
-            "avg_overall": run["summary_metrics"].get("avg_overall"),
-            "avg_relevance": run["summary_metrics"].get("avg_relevance"),
-            "avg_faithfulness": run["summary_metrics"].get("avg_faithfulness"),
-            "avg_completeness": run["summary_metrics"].get("avg_completeness"),
-            "completed": run["summary_metrics"].get("completed"),
-            "total": run["summary_metrics"].get("total_examples"),
-            "created_at": run["created_at"]
-        })
-    
+        pc = run["pipeline_configs"]
+        summary = run["summary_metrics"] or {}
+
+        comparison.append(
+            {
+                "eval_run_id": run["id"],
+                "config_name": pc["name"],
+                "config_params": pc["parameters"],
+                "origin": pc.get("origin", "manual"),
+                "created_by_agent_run_id": pc.get("created_by_agent_run_id"),
+                "parent_config_id": pc.get("parent_config_id"),
+                "avg_overall": summary.get("avg_overall"),
+                "avg_relevance": summary.get("avg_relevance"),
+                "avg_faithfulness": summary.get("avg_faithfulness"),
+                "avg_completeness": summary.get("avg_completeness"),
+                "completed": summary.get("completed"),
+                "total": summary.get("total_examples"),
+                "created_at": run["created_at"],
+            }
+        )
+
     # Sort by avg_overall descending (best first)
-    comparison.sort(key=lambda x: x["avg_overall"] if x["avg_overall"] else 0, reverse=True)
-    
+    comparison.sort(
+        key=lambda x: x["avg_overall"] if x["avg_overall"] is not None else 0,
+        reverse=True,
+    )
+
     return {
         "eval_set_id": eval_set_id,
         "total_runs": len(comparison),
         "runs": comparison,
-        "winner": comparison[0] if comparison else None
+        "winner": comparison[0] if comparison else None,
     }
+    
 
 # ============================================
 # WEEK 3: AUTONOMOUS AGENTS
@@ -1225,26 +1241,40 @@ Provide ONLY the JSON response, no additional text."""
         # so they're ready to test in Phase 3
         
         workspace_id = run_info["eval_sets"].get("workspace_id")
-        
+        current_config = run_info["pipeline_configs"]
+
         created_configs = []
         for suggestion in suggestions_data["suggestions"]:
-            # Insert into pipeline_configs table
-            new_config = supabase.table("pipeline_configs").insert({
-                "workspace_id": workspace_id,
-                "name": suggestion["name"],
-                "description": suggestion["description"],
-                "parameters": suggestion["parameters"],
-                "is_active": False  # Not active yet, needs testing first
-            }).execute()
-            
-            # Build response object
-            created_configs.append(AgentConfigSuggestion(
-                name=suggestion["name"],
-                description=suggestion["description"],
-                parameters=suggestion["parameters"],
-                reasoning=suggestion["reasoning"],
-                expected_improvement=suggestion["expected_improvement"]
-            ))
+            # Insert into pipeline_configs table with provenance
+            insert_result = (
+                supabase.table("pipeline_configs")
+                .insert(
+                    {
+                        "workspace_id": workspace_id,
+                        "name": suggestion["name"],
+                        "description": suggestion["description"],
+                        "parameters": suggestion["parameters"],
+                        "is_active": False,  # Not active yet, needs testing first
+                        # provenance fields
+                        "origin": "agent_suggested",
+                        "created_by_agent_run_id": request.eval_run_id,
+                        "parent_config_id": current_config["id"],
+                    }
+                )
+                .execute()
+            )
+
+            # We do not need extra fields in the API response,
+            # keep using the suggestion data to build the model
+            created_configs.append(
+                AgentConfigSuggestion(
+                    name=suggestion["name"],
+                    description=suggestion["description"],
+                    parameters=suggestion["parameters"],
+                    reasoning=suggestion["reasoning"],
+                    expected_improvement=suggestion["expected_improvement"],
+                )
+            )
             
             print(f"   ✅ Created config in DB: {suggestion['name']}")
         
