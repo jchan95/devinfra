@@ -908,10 +908,14 @@ async def analyze_eval_results(request: AgentAnalysisRequest):
     
     try:
         # Step 1: Fetch the eval run data
-        eval_run = supabase.table("eval_runs") \
-            .select("*, pipeline_configs(name, parameters), eval_sets(name)") \
-            .eq("id", request.eval_run_id) \
+        eval_run = (
+            supabase.table("eval_runs")
+            .select(
+                "*, pipeline_configs(id, name, parameters), eval_sets(name, workspace_id)"
+            )
+            .eq("id", request.eval_run_id)
             .execute()
+        )
         
         if not eval_run.data:
             raise HTTPException(status_code=404, detail="Eval run not found")
@@ -1084,10 +1088,14 @@ async def suggest_pipeline_configs(request: AgentConfigSuggestionsRequest):
         # - Which questions failed
         print("   📊 Fetching eval run data...")
         
-        eval_run = supabase.table("eval_runs") \
-            .select("*, pipeline_configs(name, parameters), eval_sets(name, workspace_id)") \
-            .eq("id", request.eval_run_id) \
+        eval_run = (
+            supabase.table("eval_runs")
+            .select(
+                "*, pipeline_configs(id, name, parameters), eval_sets(name, workspace_id)"
+            )
+            .eq("id", request.eval_run_id)
             .execute()
+        )
         
         if not eval_run.data:
             raise HTTPException(status_code=404, detail="Eval run not found")
