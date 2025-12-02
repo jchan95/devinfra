@@ -1295,7 +1295,8 @@ Question {i}: {row['eval_examples']['question']}
         print(f"   ❌ Error in config suggestion agent: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================@app.post("/agent/auto-tune", response_model=AutoTuneResponse, tags=["agents"])
+# ============================================
+@app.post("/agent/auto-tune", response_model=AutoTuneResponse, tags=["agents"])
 async def auto_tune_agent(request: AutoTuneRequest):
     """
     Phase 3: Auto-Tuner Orchestrator
