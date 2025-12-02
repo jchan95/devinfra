@@ -894,6 +894,31 @@ class AgentAnalysisResponse(BaseModel):
     recommendations: List[str]
     claude_reasoning: str
 
+class AutoTuneRequest(BaseModel):
+    """Request to run autonomous tuning loop"""
+    workspace_id: str
+    eval_set_id: str
+    max_iterations: int = 3
+
+class AutoTuneHistoryItem(BaseModel):
+    """One iteration of the auto-tune loop"""
+    iteration: int
+    eval_run_id: str
+    pipeline_config_id: str
+    pipeline_config_name: str
+    avg_overall: float
+
+class AutoTuneResponse(BaseModel):
+    """Result of auto-tune run"""
+    status: str
+    total_iterations: int
+    final_score: float
+    final_config_id: str
+    final_config_name: str
+    starting_score: Optional[float] = None
+    improvement: Optional[float] = None
+    history: List[AutoTuneHistoryItem]
+
 @app.post("/agent/analyze", response_model=AgentAnalysisResponse, tags=["agents"])
 async def analyze_eval_results(request: AgentAnalysisRequest):
     """
@@ -1127,59 +1152,59 @@ Question {i}: {row['eval_examples']['question']}
         # Step 4: Build Claude prompt to propose new configs
         prompt = f"""You are an expert RAG systems engineer designing retrieval configs.
 
-You are given the current pipeline configuration, its evaluation results, and any existing configs.
-Your job is to propose better retrieval configurations that should improve scores on this eval set.
+        You are given the current pipeline configuration, its evaluation results, and any existing configs.
+        Your job is to propose better retrieval configurations that should improve scores on this eval set.
 
-CURRENT CONFIG:
-Name: {current_config['name']}
-Parameters (JSON):
-{json.dumps(current_config['parameters'], indent=2)}
+        CURRENT CONFIG:
+        Name: {current_config['name']}
+        Parameters (JSON):
+        {json.dumps(current_config['parameters'], indent=2)}
 
-SUMMARY METRICS (0 to 5 scale):
-- Overall: {summary_metrics.get('avg_overall', 0)}
-- Relevance: {summary_metrics.get('avg_relevance', 0)}
-- Faithfulness: {summary_metrics.get('avg_faithfulness', 0)}
-- Completeness: {summary_metrics.get('avg_completeness', 0)}
-- Completed: {summary_metrics.get('completed', 0)}/{summary_metrics.get('total_examples', 0)}
+        SUMMARY METRICS (0 to 5 scale):
+        - Overall: {summary_metrics.get('avg_overall', 0)}
+        - Relevance: {summary_metrics.get('avg_relevance', 0)}
+        - Faithfulness: {summary_metrics.get('avg_faithfulness', 0)}
+        - Completeness: {summary_metrics.get('avg_completeness', 0)}
+        - Completed: {summary_metrics.get('completed', 0)}/{summary_metrics.get('total_examples', 0)}
 
-EXISTING CONFIGS IN WORKSPACE:
-{json.dumps(existing_configs, indent=2)}
+        EXISTING CONFIGS IN WORKSPACE:
+        {json.dumps(existing_configs, indent=2)}
 
-DETAILED QUESTION RESULTS:
-{results_text}
+        DETAILED QUESTION RESULTS:
+        {results_text}
 
-YOUR TASK:
-Propose {request.num_suggestions} new pipeline config variants that may outperform the current one on this eval set.
+        YOUR TASK:
+        Propose {request.num_suggestions} new pipeline config variants that may outperform the current one on this eval set.
 
-For each suggested config, you MUST provide:
-- name: Short, descriptive name.
-- description: One or two sentence description of what it tries to change.
-- parameters: A JSON object with explicit numeric values for:
-    - top_k (int)
-    - chunk_size (int)
-    - chunk_overlap (int)
-    - similarity_threshold (float between 0 and 1)
-- reasoning: Why this configuration should help, tied back to the eval results.
-- expected_improvement: A short statement describing where you expect scores to improve.
+        For each suggested config, you MUST provide:
+        - name: Short, descriptive name.
+        - description: One or two sentence description of what it tries to change.
+        - parameters: A JSON object with explicit numeric values for:
+            - top_k (int)
+            - chunk_size (int)
+            - chunk_overlap (int)
+            - similarity_threshold (float between 0 and 1)
+        - reasoning: Why this configuration should help, tied back to the eval results.
+        - expected_improvement: A short statement describing where you expect scores to improve.
 
-RESPONSE FORMAT (JSON only, no markdown, no extra text):
-{{
-  "suggestions": [
-    {{
-      "name": "Config name",
-      "description": "What this config is trying to do",
-      "parameters": {{
-        "top_k": 6,
-        "chunk_size": 600,
-        "chunk_overlap": 80,
-        "similarity_threshold": 0.52
-      }},
-      "reasoning": "Why this particular combination should help.",
-      "expected_improvement": "Where you expect the scores to improve."
-    }}
-  ],
-  "reasoning": "Overall comparison of the proposed configs and how they relate to the baseline."
-}}"""
+        RESPONSE FORMAT (JSON only, no markdown, no extra text):
+        {{
+        "suggestions": [
+            {{
+            "name": "Config name",
+            "description": "What this config is trying to do",
+            "parameters": {{
+                "top_k": 6,
+                "chunk_size": 600,
+                "chunk_overlap": 80,
+                "similarity_threshold": 0.52
+            }},
+            "reasoning": "Why this particular combination should help.",
+            "expected_improvement": "Where you expect the scores to improve."
+            }}
+        ],
+        "reasoning": "Overall comparison of the proposed configs and how they relate to the baseline."
+        }}"""
 
         # Step 5: Call Claude to generate suggestions
         print("   🤖 Calling Claude API for config suggestions...")
@@ -1268,4 +1293,137 @@ RESPONSE FORMAT (JSON only, no markdown, no extra text):
         )
     except Exception as e:
         print(f"   ❌ Error in config suggestion agent: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================@app.post("/agent/auto-tune", response_model=AutoTuneResponse, tags=["agents"])
+async def auto_tune_agent(request: AutoTuneRequest):
+    """
+    Phase 3: Auto-Tuner Orchestrator
+    
+    Autonomous loop that:
+    1. Runs eval with current best config
+    2. Analyzes results
+    3. Generates new configs
+    4. Tests new configs
+    5. Keeps the winner
+    """
+    print(f"\n🔄 Auto-Tuner: Starting autonomous optimization loop")
+    print(f"   Workspace: {request.workspace_id}")
+    print(f"   Eval Set: {request.eval_set_id}")
+    print(f"   Max Iterations: {request.max_iterations}")
+    
+    history = []
+    
+    try:
+        # Step 1: Find current best config from existing eval runs
+        comparison = await compare_eval_runs(request.eval_set_id)
+        runs = comparison.get("runs", [])
+        
+        if runs:
+            best = runs[0]
+            current_config_id = best["pipeline_config_id"]
+            current_config_name = best["config_name"]
+            current_best_score = float(best["avg_overall"] or 0)
+            starting_score = current_best_score
+            print(f"   📊 Starting from best config: '{current_config_name}' (score: {current_best_score})")
+        else:
+            baseline = supabase.table("pipeline_configs") \
+                .select("*") \
+                .eq("workspace_id", request.workspace_id) \
+                .eq("is_active", True) \
+                .order("created_at", desc=True) \
+                .limit(1) \
+                .execute()
+            
+            if not baseline.data:
+                raise HTTPException(status_code=400, detail="No pipeline configs found for this workspace")
+            
+            cfg = baseline.data[0]
+            current_config_id = cfg["id"]
+            current_config_name = cfg["name"]
+            current_best_score = 0.0
+            starting_score = 0.0
+            print(f"   📊 No existing runs. Starting from config: '{current_config_name}'")
+        
+        # Step 2: Run the optimization loop
+        for iteration in range(1, request.max_iterations + 1):
+            print(f"\n   🔁 Iteration {iteration}/{request.max_iterations}")
+            
+            # 2a. Run eval with current config
+            print(f"      Running eval with '{current_config_name}'...")
+            eval_result = await run_evaluation(EvalRunCreate(
+                eval_set_id=request.eval_set_id,
+                pipeline_config_id=current_config_id
+            ))
+            
+            eval_run_id = eval_result["eval_run_id"]
+            avg_overall = float(eval_result["avg_scores"]["avg_overall"])
+            
+            print(f"      ✓ Eval complete. Score: {avg_overall}")
+            
+            history.append(AutoTuneHistoryItem(
+                iteration=iteration,
+                eval_run_id=eval_run_id,
+                pipeline_config_id=current_config_id,
+                pipeline_config_name=current_config_name,
+                avg_overall=avg_overall
+            ))
+            
+            if avg_overall > current_best_score:
+                current_best_score = avg_overall
+                print(f"      🎉 New best score: {current_best_score}")
+            
+            # 2b. Generate new config suggestions
+            print(f"      Generating new config suggestions...")
+            suggestions_response = await suggest_pipeline_configs(
+                AgentConfigSuggestionsRequest(
+                    eval_run_id=eval_run_id,
+                    num_suggestions=1
+                )
+            )
+            
+            if not suggestions_response.suggestions:
+                print(f"      ⚠️ No new configs suggested. Stopping.")
+                break
+            
+            # 2c. Get the newly created config
+            newest_config = supabase.table("pipeline_configs") \
+                .select("*") \
+                .eq("workspace_id", request.workspace_id) \
+                .eq("origin", "agent_suggested") \
+                .order("created_at", desc=True) \
+                .limit(1) \
+                .execute()
+            
+            if not newest_config.data:
+                print(f"      ⚠️ Could not find newly created config. Stopping.")
+                break
+            
+            candidate = newest_config.data[0]
+            current_config_id = candidate["id"]
+            current_config_name = candidate["name"]
+            print(f"      ✓ Next iteration will test: '{current_config_name}'")
+        
+        # Step 3: Calculate improvement
+        improvement = current_best_score - starting_score if starting_score else None
+        
+        print(f"\n✅ Auto-tune complete!")
+        print(f"   Final score: {current_best_score}")
+        print(f"   Improvement: {improvement if improvement else 'N/A'}")
+        
+        return AutoTuneResponse(
+            status="completed",
+            total_iterations=len(history),
+            final_score=current_best_score,
+            final_config_id=current_config_id,
+            final_config_name=current_config_name,
+            starting_score=starting_score,
+            improvement=improvement,
+            history=history
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in auto-tune: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
