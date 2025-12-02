@@ -1062,23 +1062,21 @@ class AgentConfigSuggestionsResponse(BaseModel):
 async def suggest_pipeline_configs(request: AgentConfigSuggestionsRequest):
     """
     Phase 2: Config Generator Agent
-    
-    Claude analyzes eval results and automatically proposes new pipeline 
+
+    Claude analyzes eval results and automatically proposes new pipeline
     configurations that should perform better.
-    
-    Analogy: Like an experimental chef proposing new recipes based on 
-    customer feedback about what's missing in the current dish.
-    
+
     How it works:
-    1. Fetch eval run data and see what's failing
+    1. Fetch eval run data and see what is failing
     2. Ask Claude to propose better configs
     3. Claude returns specific parameter combinations with reasoning
     4. Automatically create those configs in the database
-    5. Ready to test in Phase 3!
+    5. Ready to test in Phase 3
     """
     print(
         f"\n💡 Config Generator: Creating {request.num_suggestions} new configs based on eval run {request.eval_run_id}"
     )
+
     try:
         # Step 1: Fetch eval run with its config and eval set
         eval_run = (
@@ -1097,7 +1095,6 @@ async def suggest_pipeline_configs(request: AgentConfigSuggestionsRequest):
         current_config = run_info["pipeline_configs"]
         eval_set = run_info["eval_sets"]
         workspace_id = eval_set["workspace_id"]
-
         summary_metrics = run_info.get("summary_metrics") or {}
 
         # Step 2: Fetch detailed question level results for prompt context
@@ -1116,11 +1113,22 @@ Question {i}: {row['eval_examples']['question']}
 - Judge Explanation: {row['judge_explanation']}
 """
 
-        # Step 3: Build Claude prompt to propose new configs
+        # Step 3: Fetch existing configs for this workspace
+        existing_configs_result = (
+            supabase.table("pipeline_configs")
+            .select(
+                "id, name, parameters, origin, parent_config_id, created_by_agent_run_id, created_at"
+            )
+            .eq("workspace_id", workspace_id)
+            .execute()
+        )
+        existing_configs = existing_configs_result.data or []
+
+        # Step 4: Build Claude prompt to propose new configs
         prompt = f"""You are an expert RAG systems engineer designing retrieval configs.
 
-You are given the current pipeline configuration and its evaluation results.
-Your job is to propose better retrieval configurations that should improve scores.
+You are given the current pipeline configuration, its evaluation results, and any existing configs.
+Your job is to propose better retrieval configurations that should improve scores on this eval set.
 
 CURRENT CONFIG:
 Name: {current_config['name']}
@@ -1133,6 +1141,9 @@ SUMMARY METRICS (0 to 5 scale):
 - Faithfulness: {summary_metrics.get('avg_faithfulness', 0)}
 - Completeness: {summary_metrics.get('avg_completeness', 0)}
 - Completed: {summary_metrics.get('completed', 0)}/{summary_metrics.get('total_examples', 0)}
+
+EXISTING CONFIGS IN WORKSPACE:
+{json.dumps(existing_configs, indent=2)}
 
 DETAILED QUESTION RESULTS:
 {results_text}
@@ -1148,32 +1159,29 @@ For each suggested config, you MUST provide:
     - chunk_size (int)
     - chunk_overlap (int)
     - similarity_threshold (float between 0 and 1)
-- reasoning: Why this configuration should help based on the results.
-- expected_improvement: Plain language description of what scores should improve and why.
+- reasoning: Why this configuration should help, tied back to the eval results.
+- expected_improvement: A short statement describing where you expect scores to improve.
 
-RESPONSE FORMAT (JSON only, no markdown):
+RESPONSE FORMAT (JSON only, no markdown, no extra text):
 {{
-    "suggestions": [
-        {{
-            "name": "string",
-            "description": "string",
-            "parameters": {{
-                "top_k": 6,
-                "chunk_size": 600,
-                "chunk_overlap": 80,
-                "similarity_threshold": 0.45
-            }},
-            "reasoning": "string",
-            "expected_improvement": "string"
-        }}
-    ],
-    "summary_reasoning": "High level explanation of the strategy you used."
-}}
+  "suggestions": [
+    {{
+      "name": "Config name",
+      "description": "What this config is trying to do",
+      "parameters": {{
+        "top_k": 6,
+        "chunk_size": 600,
+        "chunk_overlap": 80,
+        "similarity_threshold": 0.52
+      }},
+      "reasoning": "Why this particular combination should help.",
+      "expected_improvement": "Where you expect the scores to improve."
+    }}
+  ],
+  "reasoning": "Overall comparison of the proposed configs and how they relate to the baseline."
+}}"""
 
-Do NOT include any text outside of this JSON structure.
-"""
-
-        # Step 4: Call Claude to get suggestions
+        # Step 5: Call Claude to generate suggestions
         print("   🤖 Calling Claude API for config suggestions...")
         message = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -1185,226 +1193,79 @@ Do NOT include any text outside of this JSON structure.
 
         # Remove markdown code fences if present
         if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
+            response_text = response_text.split("```", 1)[1]
             if response_text.startswith("json"):
                 response_text = response_text[4:]
             response_text = response_text.strip()
 
-        parsed = json.loads(response_text)
+        payload = json.loads(response_text)
+        raw_suggestions = payload.get("suggestions", [])
+        overall_reasoning = payload.get("reasoning", "")
 
-        raw_suggestions = parsed.get("suggestions", [])
         if not isinstance(raw_suggestions, list) or not raw_suggestions:
             raise HTTPException(
                 status_code=500,
-                detail="Claude returned no config suggestions",
+                detail="Claude did not return any config suggestions",
             )
 
-        # Limit to requested number
-        raw_suggestions = raw_suggestions[: request.num_suggestions]
+        saved_suggestions: List[AgentConfigSuggestion] = []
 
-        created_suggestions: List[AgentConfigSuggestion] = []
-
-        # Step 5: Insert each suggestion as a new pipeline_config
+        # Step 6: Insert each suggested config into the database
         for suggestion in raw_suggestions:
             params = suggestion.get("parameters") or {}
+            name = suggestion.get("name", "Agent suggested config")
+            description = suggestion.get("description", "")
+            reasoning = suggestion.get("reasoning", "")
+            expected_improvement = suggestion.get("expected_improvement", "")
+
             insert_result = (
                 supabase.table("pipeline_configs")
                 .insert(
                     {
                         "workspace_id": workspace_id,
-                        "name": suggestion.get("name", "Agent suggested config"),
-                        "description": suggestion.get("description"),
+                        "name": name,
+                        "description": description,
                         "parameters": params,
-                        "is_active": True,
+                        "is_active": False,
                         "origin": "agent_suggested",
-                        "created_by_agent_run_id": request.eval_run_id,
                         "parent_config_id": current_config["id"],
+                        "created_by_agent_run_id": request.eval_run_id,
                     }
                 )
-                .select()
                 .execute()
             )
 
-            created = insert_result.data[0]
+            new_config = insert_result.data[0]
 
-            created_suggestions.append(
+            saved_suggestions.append(
                 AgentConfigSuggestion(
-                    name=created["name"],
-                    description=created.get("description") or "",
+                    name=name,
+                    description=description,
                     parameters=params,
-                    reasoning=suggestion.get("reasoning", ""),
-                    expected_improvement=suggestion.get("expected_improvement", ""),
+                    reasoning=reasoning,
+                    expected_improvement=expected_improvement,
                 )
             )
 
-        print(f"   ✅ Created {len(created_suggestions)} new configs")
+            print(
+                f"   ✅ Created suggested config '{name}' (id={new_config['id']}) from eval run {request.eval_run_id}"
+            )
+
+        print(f"   ✅ Finished creating {len(saved_suggestions)} new configs")
 
         return AgentConfigSuggestionsResponse(
             eval_run_id=request.eval_run_id,
             current_config_name=current_config["name"],
             current_score=summary_metrics.get("avg_overall", 0.0),
-            suggestions=created_suggestions,
-            claude_reasoning=parsed.get("summary_reasoning", ""),
+            suggestions=saved_suggestions,
+            claude_reasoning=overall_reasoning,
         )
 
     except json.JSONDecodeError as e:
-        print(f"   ❌ Failed to parse Claude config suggestions JSON: {str(e)}")
+        print(f"   ❌ Failed to parse Claude's response as JSON: {str(e)}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to parse Claude config suggestions: {str(e)}",
+            status_code=500, detail=f"Failed to parse Claude response: {str(e)}"
         )
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"   ❌ Error in config suggestion agent: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================
-# AUTO-TUNE AGENT ENDPOINT (Phase 3)
-# ============================================
-
-class AutoTuneRequest(BaseModel):
-    """Request to run the auto‑tune loop"""
-    workspace_id: str
-    eval_set_id: str
-    max_iterations: int = 3
-
-
-class AutoTuneHistoryItem(BaseModel):
-    iteration: int
-    eval_run_id: str
-    pipeline_config_id: str
-    pipeline_config_name: str
-    avg_overall: float
-
-
-class AutoTuneResponse(BaseModel):
-    status: str
-    total_iterations: int
-    final_score: float
-    final_config_id: str
-    final_config_name: str
-    history: List[AutoTuneHistoryItem]
-
-
-@app.post("/agent/auto-tune", response_model=AutoTuneResponse, tags=["agents"])
-async def auto_tune_agent(request: AutoTuneRequest):
-    """
-    Phase 3: Auto‑Tune Agent
-
-    This endpoint runs a small closed loop over the eval set:
-
-    1. Starts from the current best configuration for the eval set.
-    2. Runs an eval with that config (if one is not already present).
-    3. Asks the config generator agent to propose a better config.
-    4. Evaluates the new config.
-    5. Keeps whichever config has the better score.
-    6. Repeats up to `max_iterations` times.
-
-    The goal is to demonstrate the end‑to‑end tuning loop, not to expose every knob.
-    """
-    try:
-        history: List[AutoTuneHistoryItem] = []
-
-        # Step 1: figure out the current best config for this eval set, if any
-        comparison = await compare_eval_runs(request.eval_set_id)
-        runs = comparison.get("runs", []) if isinstance(comparison, dict) else []
-
-        if runs:
-            # winner is already sorted to index 0 in compare_eval_runs
-            best = runs[0]
-            current_config_id = best["pipeline_config_id"]
-            current_config_name = best["config_name"]
-            current_best_score = float(best.get("avg_overall") or 0.0)
-        else:
-            # No completed evals yet, so fall back to a baseline config in this workspace
-            baseline = (
-                supabase.table("pipeline_configs")
-                .select("*")
-                .eq("workspace_id", request.workspace_id)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            if not baseline.data:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No pipeline configs found for this workspace. Create a baseline config first.",
-                )
-            cfg = baseline.data[0]
-            current_config_id = cfg["id"]
-            current_config_name = cfg["name"]
-            current_best_score = 0.0
-
-        total_iterations = 0
-
-        for iteration in range(1, max(request.max_iterations, 1) + 1):
-            total_iterations = iteration
-
-            # Step 2: run an eval for the current config
-            eval_status = await run_evaluation(
-                EvalRunCreate(
-                    eval_set_id=request.eval_set_id,
-                    pipeline_config_id=current_config_id,
-                )
-            )
-
-            eval_run_id = eval_status["eval_run_id"]
-            avg_scores = eval_status.get("avg_scores") or {}
-            avg_overall = float(avg_scores.get("avg_overall") or 0.0)
-
-            history.append(
-                AutoTuneHistoryItem(
-                    iteration=iteration,
-                    eval_run_id=eval_run_id,
-                    pipeline_config_id=current_config_id,
-                    pipeline_config_name=current_config_name,
-                    avg_overall=avg_overall,
-                )
-            )
-
-            # Update best seen so far
-            if avg_overall > current_best_score:
-                current_best_score = avg_overall
-
-            # Step 3: ask the config generator agent for one better config
-            suggestions = await suggest_pipeline_configs(
-                AgentConfigSuggestionsRequest(eval_run_id=eval_run_id, num_suggestions=1)
-            )
-
-            # The suggest‑configs endpoint both returns suggestions and inserts
-            # new configs into `pipeline_configs`. We grab the newest config
-            # in this workspace as the candidate for the next iteration.
-            newest_cfg = (
-                supabase.table("pipeline_configs")
-                .select("*")
-                .eq("workspace_id", request.workspace_id)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-
-            if not newest_cfg.data:
-                # If for some reason no new config was created, stop the loop gracefully.
-                break
-
-            candidate = newest_cfg.data[0]
-            current_config_id = candidate["id"]
-            current_config_name = candidate["name"]
-
-        return AutoTuneResponse(
-            status="completed",
-            total_iterations=total_iterations,
-            final_score=current_best_score,
-            final_config_id=current_config_id,
-            final_config_name=current_config_name,
-            history=history,
-        )
-
-    except HTTPException:
-        # Re‑raise HTTPExceptions so FastAPI preserves the status code.
-        raise
-    except Exception as e:
-        print(f"❌ Error in auto‑tune agent: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
