@@ -918,6 +918,8 @@ class AutoTuneResponse(BaseModel):
     starting_score: Optional[float] = None
     improvement: Optional[float] = None
     history: List[AutoTuneHistoryItem]
+    auto_tune_run_id: Optional[str] = None
+    
 
 @app.post("/agent/analyze", response_model=AgentAnalysisResponse, tags=["agents"])
 async def analyze_eval_results(request: AgentAnalysisRequest):
@@ -1404,27 +1406,133 @@ async def auto_tune_agent(request: AutoTuneRequest):
             current_config_id = candidate["id"]
             current_config_name = candidate["name"]
             print(f"      ✓ Next iteration will test: '{current_config_name}'")
-        
-        # Step 3: Calculate improvement
-        improvement = current_best_score - starting_score if starting_score else None
-        
+
+        # Step 3: Prepare history as plain JSON serializable dicts
+        history_items = [
+            h.model_dump() if isinstance(h, AutoTuneHistoryItem) else h
+            for h in history
+        ]
+        total_iterations = len(history_items)
+
+        # Step 4: Calculate starting and final scores and improvement
+        final_score = current_best_score
+
+        if starting_score is None and history_items:
+            starting_score = history_items[0].get("avg_overall")
+
+        if final_score is None and history_items:
+            final_score = history_items[-1].get("avg_overall")
+
+        improvement = None
+        if starting_score is not None and final_score is not None:
+            improvement = final_score - starting_score
+
+        # Step 5: Persist this auto tune run to Supabase
+        auto_tune_run_id = None
+        try:
+            insert_result = (
+                supabase.table("auto_tune_runs")
+                .insert(
+                    {
+                        "workspace_id": request.workspace_id,
+                        "eval_set_id": request.eval_set_id,
+                        "status": "completed",
+                        "total_iterations": total_iterations,
+                        "starting_score": starting_score,
+                        "final_score": final_score,
+                        "improvement": improvement,
+                        "final_config_id": current_config_id,
+                        "final_config_name": current_config_name,
+                        "history": history_items,
+                    }
+                )
+                .execute()
+            )
+            if insert_result.data:
+                auto_tune_run_id = insert_result.data[0]["id"]
+                print(f"   Saved auto tune run {auto_tune_run_id} to Supabase")
+        except Exception as db_error:
+            print(f"   Failed to save auto tune run history: {db_error}")
+            auto_tune_run_id = None
+
+        # Step 6: Return response
         print(f"\n✅ Auto-tune complete!")
-        print(f"   Final score: {current_best_score}")
-        print(f"   Improvement: {improvement if improvement else 'N/A'}")
-        
+        print(f"   Final score: {final_score}")
+        print(f"   Improvement: {improvement if improvement is not None else 'N/A'}")
+
         return AutoTuneResponse(
             status="completed",
-            total_iterations=len(history),
-            final_score=current_best_score,
+            total_iterations=total_iterations,
+            final_score=final_score or 0.0,
             final_config_id=current_config_id,
             final_config_name=current_config_name,
             starting_score=starting_score,
             improvement=improvement,
-            history=history
+            history=history,
+            auto_tune_run_id=auto_tune_run_id,
         )
         
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Error in auto-tune: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# New endpoint: Get persistent auto tune history
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
+@app.get("/agent/auto-tune/history")
+async def get_auto_tune_history(workspace_id: str = Query(...), eval_set_id: str = Query(...)):
+    """Return persistent auto tune runs for a workspace and eval set, newest first."""
+    try:
+        result = (
+            supabase.table("auto_tune_runs")
+            .select("*")
+            .eq("workspace_id", workspace_id)
+            .eq("eval_set_id", eval_set_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        runs = []
+        for row in result.data or []:
+            history = row.get("history") or []
+
+            starting_score = row.get("starting_score")
+            final_score = row.get("final_score")
+
+            # Derive scores from history if missing
+            if history and starting_score is None:
+                starting_score = history[0].get("avg_overall")
+            if history and final_score is None:
+                final_score = history[-1].get("avg_overall")
+
+            improvement = row.get("improvement")
+            if (
+                improvement is None
+                and starting_score is not None
+                and final_score is not None
+            ):
+                improvement = final_score - starting_score
+
+            runs.append(
+                {
+                    "id": row["id"],
+                    "completedAt": row.get("created_at"),
+                    "status": row.get("status", "completed"),
+                    "total_iterations": row.get("total_iterations", 0),
+                    "starting_score": starting_score,
+                    "final_score": final_score,
+                    "improvement": improvement,
+                    "final_config_id": row.get("final_config_id"),
+                    "final_config_name": row.get("final_config_name"),
+                    "history": history,
+                }
+            )
+
+        return {"workspace_id": workspace_id, "eval_set_id": eval_set_id, "runs": runs}
+    except Exception as e:
+        print(f"Error loading auto tune history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
